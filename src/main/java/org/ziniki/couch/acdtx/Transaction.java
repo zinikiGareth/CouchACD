@@ -2,6 +2,7 @@ package org.ziniki.couch.acdtx;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.TimeUnit;
 
 import rx.Observable;
 import rx.functions.Action1;
@@ -27,6 +28,8 @@ import com.couchbase.client.java.document.json.JsonObject;
 public class Transaction {
 	private final AsyncBucket bucket;
 	private final List<Throwable> errors = new ArrayList<Throwable>();
+	private final AllDoneLatch latch = new AllDoneLatch();
+
 	private boolean rollbackOnly = false;
 
 	public Transaction(Bucket bucket) {
@@ -58,15 +61,18 @@ public class Transaction {
 			// this isn't going anywhere anyway, just don't bother
 			return Observable.from(new JsonDocument[] {});
 		}
+		latch.another();
 		JsonObject obj = JsonObject.create().put("type", type);
 		JsonDocument doc = JsonDocument.create(id, obj);
 		Observable<JsonDocument> ret = bucket.insert(doc);
 		ret.subscribe(new Action1<JsonDocument>() {
 			public void call(JsonDocument t) {
+				latch.done();
 				System.out.println("new doc for " + id + " " + t.cas());
 			}
 		}, new Action1<Throwable>() {
 			public void call(Throwable t) {
+				latch.done();
 				System.out.println("spotted error");
 				rollbackOnly = true;
 				errors.add(t);
@@ -78,6 +84,11 @@ public class Transaction {
 	public void commit() {
 		if (rollbackOnly)
 			throw new TransactionFailedException(errors);
+		boolean allDone = latch.await(5, TimeUnit.SECONDS);
+		if (!allDone) {
+			errors.add(0, new TransactionTimeoutException());
+			throw new TransactionFailedException(errors);
+		}
 		System.out.println("committed");
 	}
 }
