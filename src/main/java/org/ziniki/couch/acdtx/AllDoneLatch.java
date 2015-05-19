@@ -4,14 +4,15 @@ import java.util.Date;
 import java.util.concurrent.TimeUnit;
 
 public class AllDoneLatch {
-	private int counter = 0;
+	private int requests = 0;
+	private int completed = 0;
 	
 	public synchronized void another() {
-		counter++;
+		requests++;
 	}
 
 	public synchronized void done() {
-		counter--;
+		completed++;
 		this.notify();
 	}
 
@@ -19,7 +20,7 @@ public class AllDoneLatch {
 		long waitms = TimeUnit.MILLISECONDS.convert(amt, unit);
 		long until = new Date().getTime()+waitms;
 		synchronized (this) {
-			while (counter > 0 && new Date().getTime() < until) {
+			while (requests > completed && new Date().getTime() < until) {
 				try {
 					long waitFor = until-new Date().getTime();
 					this.wait(waitFor);
@@ -27,7 +28,12 @@ public class AllDoneLatch {
 					// ignore this
 				}
 			}
-			return counter == 0;
+			return requests == completed;
 		}
+	}
+	
+	@Override
+	public String toString() {
+		return "AllDoneLatch[" + completed + "/" + requests + "]";
 	}
 }
