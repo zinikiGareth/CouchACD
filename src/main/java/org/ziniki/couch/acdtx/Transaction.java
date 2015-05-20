@@ -34,17 +34,22 @@ public class Transaction {
 	private final AllDoneLatch latch = new AllDoneLatch();
 	private final Map<String, ReadDocument> alreadyRead = new HashMap<String, ReadDocument>();
 	private final Map<String, JsonDocument> dirtied = new HashMap<String, JsonDocument>();
+	private final JsonDocument txRecord;
 
 	public enum TxState { OPEN, ROLLBACKONLY, PREPARING, PREPARED, COMMITTING, COMMITTED };
 	
 	private TxState state = TxState.OPEN;
 
-	public Transaction(Bucket bucket) {
+	public Transaction(String txid, Bucket bucket) {
 		this.bucket = bucket.async();
+		JsonObject txo = JsonObject.create().put("id", txid).put("dirty", JsonObject.create());
+		txRecord = JsonDocument.create(txid, txo);
 	}
 	
-	public Transaction(AsyncBucket bucket) {
+	public Transaction(String txid, AsyncBucket bucket) {
 		this.bucket = bucket;
+		JsonObject txo = JsonObject.create().put("id", txid).put("dirty", JsonObject.create());
+		txRecord = JsonDocument.create(txid, txo);
 	}
 	
 	public void hold() {
@@ -92,6 +97,7 @@ public class Transaction {
 			return;
 		}
 		
+		((JsonObject) txRecord.content().get("dirty")).put(doc.id(), doc.content());
 		latch.another();
 		bucket.getAndLock(doc.id(), 30).subscribe(new Action1<JsonDocument>() {
 			public void call(JsonDocument t) {
@@ -125,6 +131,8 @@ public class Transaction {
 		
 		// Write an empty object to the store to make sure that we grab it and obtain a CAS
 		JsonObject obj = JsonObject.empty();
+		((JsonObject) txRecord.content().get("dirty")).put(id, obj);
+		System.out.println(txRecord.content());
 		JsonDocument doc = JsonDocument.create(id, obj);
 		bucket.insert(doc)
 			.subscribe(new Action1<JsonDocument>() {
@@ -151,6 +159,19 @@ public class Transaction {
 		if (state != TxState.OPEN)
 			throw new InvalidTxStateException(state.toString());
 		state = TxState.PREPARING;
+		latch.another();
+		bucket.insert(txRecord).subscribe(new Action1<JsonDocument>() {
+			public void call(JsonDocument t) {
+				System.out.println("inserted " + t);
+				latch.done();
+			}
+		}, new Action1<Throwable>() {
+			public void call(Throwable t) {
+				errors.add(0, t);
+				state = TxState.ROLLBACKONLY;
+				latch.done();
+			}
+		});
 		return latch.onReleased(5, TimeUnit.SECONDS).map(new Func1<Boolean, Throwable>() {
 			public Throwable call(Boolean t) {
 				if (!t)

@@ -2,6 +2,7 @@ package test.ziniki;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertNull;
 
 import java.lang.reflect.InvocationTargetException;
 import java.util.Date;
@@ -41,7 +42,7 @@ public class ReallyBasicTests {
 		cluster.disconnect();
 	}
 
-	private void throwEx(Observable<Throwable> opRet) throws Exception {
+	private void checkForObservedException(Observable<Throwable> opRet) throws Exception {
 		Throwable t = opRet.toBlocking().single();
 		if (t != null) {
 			if (t instanceof Exception)
@@ -51,30 +52,42 @@ public class ReallyBasicTests {
 		}
 	}
 
+	@Test
+	public void testWeCanCreateAnObject() throws Exception {
+		Transaction tx = new Transaction("tx3", bucket);
+		tx.newObject("joe", "user");
+		checkForObservedException(tx.commit());
+		assertNotNull(bucket.get("tx3"));
+		assertNotNull(bucket.get("joe"));
+	}
+
 	@Test(expected=TransactionFailedException.class)
 	public void testWeCannotCreateAnObjectWhichAlreadyExists() throws Exception {
-		Transaction tx = new Transaction(bucket);
+		Transaction tx = new Transaction("tx", bucket);
 		tx.newObject("fred", "user");
-		throwEx(tx.commit());
+		checkForObservedException(tx.commit());
+		assertNull(bucket.get("tx"));
 	}
 
 	@Test
 	public void testWeCanReadAnObjectWhichExists() throws Exception {
-		Transaction tx = new Transaction(bucket);
+		Transaction tx = new Transaction("tx1", bucket);
 		tx.get("fred").subscribe();
-		throwEx(tx.commit());
+		checkForObservedException(tx.commit());
+		assertNotNull(bucket.get("tx1"));
 	}
 
 	@Test(expected=TransactionFailedException.class)
 	public void testWeRollbackWhenAnObjectDoesNotExist() throws Exception {
-		Transaction tx = new Transaction(bucket);
+		Transaction tx = new Transaction("tx", bucket);
 		tx.get("bert").subscribe();
-		throwEx(tx.commit());
+		checkForObservedException(tx.commit());
+		assertNull(bucket.get("tx"));
 	}
 
 	@Test
 	public void testWeCanChangeAnObjectIfTheresNoRollback() throws Exception {
-		Transaction tx = new Transaction(bucket);
+		Transaction tx = new Transaction("tx2", bucket);
 		
 		Observable<JsonDocument> foo = tx.get("fred");
 		foo.subscribe(new Action1<JsonDocument>() {
@@ -82,8 +95,13 @@ public class ReallyBasicTests {
 				fred.content().put("version", 2);
 				tx.dirty(fred);
 			}
+		}, new Action1<Throwable>() {
+			public void call(Throwable t) {
+				t.printStackTrace();
+			}
 		});
-		throwEx(tx.commit());
+		checkForObservedException(tx.commit());
+		assertNotNull(bucket.get("tx2"));
 		JsonDocument readFred = bucket.get("fred");
 		Integer v = readFred.content().getInt("version");
 		assertNotNull(v);
