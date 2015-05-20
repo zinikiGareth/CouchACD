@@ -6,7 +6,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
 
-import rx.Notification;
 import rx.Observable;
 import rx.functions.Action0;
 import rx.functions.Action1;
@@ -36,7 +35,9 @@ public class Transaction {
 	private final Map<String, ReadDocument> alreadyRead = new HashMap<String, ReadDocument>();
 	private final Map<String, JsonDocument> dirtied = new HashMap<String, JsonDocument>();
 
-	private boolean rollbackOnly = false;
+	public enum TxState { OPEN, ROLLBACKONLY, PREPARING, PREPARED, COMMITTING, COMMITTED };
+	
+	private TxState state = TxState.OPEN;
 
 	public Transaction(Bucket bucket) {
 		this.bucket = bucket.async();
@@ -65,7 +66,7 @@ public class Transaction {
 			public Boolean call(JsonDocument t) {
 				if (t == null) {
 					errors.add(new ObjectNotFoundException(id));
-					rollbackOnly = true;
+					state = TxState.ROLLBACKONLY;
 					return false;
 				} else {
 					alreadyRead.put(id, new ReadDocument(t.content().hashCode(), t));
@@ -82,12 +83,12 @@ public class Transaction {
 	}
 	
 	public void dirty(JsonDocument doc) {
-		if (rollbackOnly) {
+		if (state == TxState.ROLLBACKONLY) {
 			// this isn't going anywhere anyway, just don't bother
 			return;
 		}
 		if (!alreadyRead.containsKey(doc.id())) {
-			rollbackOnly = true;
+			state = TxState.ROLLBACKONLY;
 			return;
 		}
 		
@@ -96,7 +97,7 @@ public class Transaction {
 			public void call(JsonDocument t) {
 				try {
 				if (!assertUnchanged(t.id(), t.content())) {
-					rollbackOnly = true;
+					state = TxState.ROLLBACKONLY;
 					errors.add(new ResourceChangedException("Resource " + doc.id() + " changed while attempting to lock"));
 					latch.done();
 					return;
@@ -108,7 +109,7 @@ public class Transaction {
 		}, new Action1<Throwable>() {
 			public void call(Throwable t) {
 				t.printStackTrace();
-				rollbackOnly = true;
+				state = TxState.ROLLBACKONLY;
 				errors.add(t);
 				latch.done();
 			}
@@ -116,7 +117,7 @@ public class Transaction {
 	}
 
 	public Observable<JsonDocument> newObject(String id, String type) {
-		if (rollbackOnly) {
+		if (state == TxState.ROLLBACKONLY) {
 			// this isn't going anywhere anyway, just don't bother
 			return Observable.from(new JsonDocument[] {});
 		}
@@ -134,7 +135,7 @@ public class Transaction {
 			}, new Action1<Throwable>() {
 				public void call(Throwable t) {
 					latch.done();
-					rollbackOnly = true;
+					state = TxState.ROLLBACKONLY;
 					errors.add(t);
 				}
 			});
@@ -142,24 +143,59 @@ public class Transaction {
 		// Return the user the document we originally created
 		return Observable.just(doc);
 	}
-	
-	public Observable<Integer> commit() {
-		// TODO: should be in "prepare()" - but call that from here if it's not already been called
-		if (rollbackOnly)
-			throw new TransactionFailedException(errors);
-		boolean allDone = latch.await(5, TimeUnit.SECONDS);
-		if (!allDone) {
-			errors.add(0, new TransactionTimeoutException());
-			throw new TransactionFailedException(errors);
-		}
 
-		// OK, this is commit() proper
+	public Observable<Throwable> prepare() {
+		System.out.println("In prepare(), state = " + state);
+		if (state == TxState.ROLLBACKONLY)
+			return Observable.just(new TransactionFailedException(errors));
+		if (state != TxState.OPEN)
+			throw new InvalidTxStateException(state.toString());
+		state = TxState.PREPARING;
+		return latch.onReleased(5, TimeUnit.SECONDS).map(new Func1<Boolean, Throwable>() {
+			public Throwable call(Boolean t) {
+				if (!t)
+					errors.add(0, new TransactionTimeoutException());
+				if (state == TxState.ROLLBACKONLY)
+					return new TransactionFailedException(errors);
+				state = TxState.PREPARED;
+				return null;
+			}
+		});
+	}
+	
+	private Observable<Throwable> doCommit() {
+		System.out.println("In doCommit");
+		state = TxState.COMMITTING;
 		List<Observable<?>> all = new ArrayList<Observable<?>>();
 		for (JsonDocument d : dirtied.values()) {
-			all.add(bucket.unlock(d));
-			all.add(bucket.upsert(d));
+//			all.add(bucket.unlock(d));
+			all.add(bucket.replace(d));
 		}
-		return Observable.merge(all).count();
+		return Observable.merge(all).count().map(new Func1<Integer, Throwable>() {
+			@Override
+			public Throwable call(Integer t) {
+				state = TxState.COMMITTED;
+				return null;
+			}
+		});
+	}
+
+	public Observable<Throwable> commit() {
+		Func1<Throwable, Observable<Throwable>> checkThenCommit = new Func1<Throwable, Observable<Throwable>>() {
+			@Override
+			public Observable<Throwable> call(Throwable t) {
+				System.out.println("in CTC, t = " + t);
+				if (t != null)
+					return Observable.just(t);
+				return doCommit();
+			}
+		};
+		if (state == TxState.OPEN || state == TxState.ROLLBACKONLY)
+			return prepare().flatMap(checkThenCommit);
+		else if (state == TxState.PREPARED)
+			return doCommit();
+		else
+			throw new InvalidTxStateException(state.toString());
 	}
 
 	// Assert according to our rules that the document has not changed since
