@@ -36,6 +36,7 @@ import com.couchbase.client.java.document.json.JsonObject;
  *
  */
 public class Transaction {
+	private final TransactionFactory factory;
 	private final String txid;
 	private final AsyncBucket bucket;
 	private final List<Throwable> errors = new ArrayList<Throwable>();
@@ -49,6 +50,7 @@ public class Transaction {
 	private TxState state = TxState.OPEN;
 
 	Transaction(TransactionFactory factory, String txid, AsyncBucket bucket) {
+		this.factory = factory;
 		this.txid = txid;
 		this.bucket = bucket;
 		JsonObject txo = JsonObject.create().put("id", txid).put("dirty", JsonObject.create());
@@ -189,6 +191,8 @@ public class Transaction {
 			throw new InvalidTxStateException(state.toString());
 		state = TxState.PREPARING;
 		latch.another();
+		txRecord.content().put("state", "prepared");
+		bucket.insert(JsonDocument.create(factory.lockPrefix()+txid, 15, JsonObject.create()));
 		bucket.insert(txRecord).subscribe(new Action1<JsonDocument>() {
 			public void call(JsonDocument t) {
 				System.out.println("inserted " + t);
@@ -225,6 +229,8 @@ public class Transaction {
 			@Override
 			public Throwable call(Integer t) {
 				state = TxState.COMMITTED;
+				txRecord.content().put("state", "committed");
+				bucket.replace(txRecord);
 				return null;
 			}
 		});
@@ -268,8 +274,10 @@ public class Transaction {
 	private boolean assertUnchanged(String id, JsonObject newContent) {
 		ReadDocument mine = alreadyRead.get(id);
 
-		// TODO: having a field be sufficient
-		return mine != null && mine.hash == newContent.hashCode();
+		String versionField = factory.versionField();
+		if (versionField == null)
+			return mine != null && mine.hash == newContent.hashCode();
+		return mine.doc.content().getBoolean(versionField).equals(newContent.get(versionField));
 	}
 
 }
