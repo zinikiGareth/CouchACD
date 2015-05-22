@@ -102,15 +102,20 @@ public class Transaction {
 		bucket.getAndLock(doc.id(), 30).subscribe(new Action1<JsonDocument>() {
 			public void call(JsonDocument t) {
 				try {
-				if (!assertUnchanged(t.id(), t.content())) {
+					// CAS -1 means we could not obtain the lock
+					if (t.cas() == -1 || !assertUnchanged(t.id(), t.content())) {
+						state = TxState.ROLLBACKONLY;
+						errors.add(new ResourceChangedException("Resource " + doc.id() + " changed while attempting to lock"));
+						latch.done();
+						return;
+					}
+					dirtied.put(doc.id(), JsonDocument.create(doc.id(), doc.content(), t.cas()));
+				} catch (Throwable t1) {
+					t1.printStackTrace();
 					state = TxState.ROLLBACKONLY;
-					errors.add(new ResourceChangedException("Resource " + doc.id() + " changed while attempting to lock"));
-					latch.done();
-					return;
+					errors.add(t1);
 				}
-				dirtied.put(doc.id(), JsonDocument.create(doc.id(), doc.content(), t.cas()));
-				latch.done();
-				} catch (Throwable t1) { t1.printStackTrace(); }
+				finally { latch.done(); }
 			}
 		}, new Action1<Throwable>() {
 			public void call(Throwable t) {
@@ -154,8 +159,10 @@ public class Transaction {
 
 	public Observable<Throwable> prepare() {
 		System.out.println("In prepare(), state = " + state);
-		if (state == TxState.ROLLBACKONLY)
+		if (state == TxState.ROLLBACKONLY) {
+			unlockDirties();
 			return Observable.just(new TransactionFailedException(errors));
+		}
 		if (state != TxState.OPEN)
 			throw new InvalidTxStateException(state.toString());
 		state = TxState.PREPARING;
@@ -217,6 +224,19 @@ public class Transaction {
 			return doCommit();
 		else
 			throw new InvalidTxStateException(state.toString());
+	}
+	
+	public void rollback() {
+		if (state != TxState.OPEN && state != TxState.ROLLBACKONLY && state != TxState.PREPARED)
+			throw new InvalidTxStateException(state.toString());
+		state = TxState.ROLLBACKONLY;
+		bucket.remove(txRecord);
+		unlockDirties();
+	}
+
+	private void unlockDirties() {
+		for (JsonDocument x : dirtied.values())
+			bucket.unlock(x);
 	}
 
 	// Assert according to our rules that the document has not changed since

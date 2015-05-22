@@ -10,6 +10,7 @@ import java.util.Date;
 import org.junit.AfterClass;
 import org.junit.BeforeClass;
 import org.junit.Test;
+import org.ziniki.couch.acdtx.InvalidTxStateException;
 import org.ziniki.couch.acdtx.Transaction;
 import org.ziniki.couch.acdtx.TransactionFailedException;
 
@@ -103,8 +104,73 @@ public class ReallyBasicTests {
 		checkForObservedException(tx.commit());
 		assertNotNull(bucket.get("tx2"));
 		JsonDocument readFred = bucket.get("fred");
+		assertNotNull(readFred);
 		Integer v = readFred.content().getInt("version");
 		assertNotNull(v);
 		assertEquals(2, (int)v);
+	}
+	
+	@Test
+	public void testWeCanRollbackATxByHandAsItWere() throws Exception {
+		Transaction tx = new Transaction("tx4", bucket);
+		
+		Observable<JsonDocument> foo = tx.get("fred");
+		foo.subscribe(new Action1<JsonDocument>() {
+			public void call(JsonDocument fred) {
+				fred.content().put("version", 2);
+				tx.dirty(fred);
+			}
+		}, new Action1<Throwable>() {
+			public void call(Throwable t) {
+				t.printStackTrace();
+			}
+		});
+		tx.rollback();
+		assertNull(bucket.get("tx4"));
+		JsonDocument readFred = bucket.get("fred");
+		assertNotNull(readFred);
+		assertNull(readFred.content().getInt("version"));
+	}
+	
+	@Test
+	public void testWeCanStillRollbackATxByHandAfterWeCallPrepare() throws Exception {
+		Transaction tx = new Transaction("tx4", bucket);
+		
+		Observable<JsonDocument> foo = tx.get("fred");
+		foo.subscribe(new Action1<JsonDocument>() {
+			public void call(JsonDocument fred) {
+				fred.content().put("version", 2);
+				tx.dirty(fred);
+			}
+		}, new Action1<Throwable>() {
+			public void call(Throwable t) {
+				t.printStackTrace();
+			}
+		});
+		checkForObservedException(tx.prepare());
+		tx.rollback();
+		assertNull(bucket.get("tx4"));
+		JsonDocument readFred = bucket.get("fred");
+		assertNotNull(readFred);
+		assertNull(readFred.content().getInt("version"));
+	}
+	
+	@Test(expected=InvalidTxStateException.class)
+	public void testWeCannotStillRollbackATxByHandAfterCommit() throws Exception {
+		Transaction tx = new Transaction("tx5", bucket);
+		
+		Observable<JsonDocument> foo = tx.get("fred");
+		foo.subscribe(new Action1<JsonDocument>() {
+			public void call(JsonDocument fred) {
+				fred.content().put("version", 2);
+				tx.dirty(fred);
+			}
+		}, new Action1<Throwable>() {
+			public void call(Throwable t) {
+				t.printStackTrace();
+			}
+		});
+		checkForObservedException(tx.commit());
+		tx.rollback();
 	}
 }
