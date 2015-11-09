@@ -6,6 +6,9 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import rx.Observable;
 import rx.functions.Action0;
 import rx.functions.Action1;
@@ -14,6 +17,7 @@ import rx.functions.Func1;
 import com.couchbase.client.java.AsyncBucket;
 import com.couchbase.client.java.document.JsonDocument;
 import com.couchbase.client.java.document.json.JsonObject;
+import com.couchbase.client.java.error.DocumentDoesNotExistException;
 
 /**
  * A Transaction is created by the TransactionFactory to represent one
@@ -36,6 +40,7 @@ import com.couchbase.client.java.document.json.JsonObject;
  *
  */
 public class Transaction {
+	public static Logger logger = LoggerFactory.getLogger("CouchACDTx");
 	private final TransactionFactory factory;
 	private final String txid;
 	private final AsyncBucket bucket;
@@ -117,6 +122,7 @@ public class Transaction {
 		latch.another();
 		bucket.getAndLock(id, 30).subscribe(new Action1<JsonDocument>() {
 			public void call(JsonDocument t) {
+				logger.info("Make object dirty: " + id);
 				try {
 					// CAS -1 means we could not obtain the lock
 					if (t.cas() == -1 || !assertUnchanged(t.id(), t.content())) {
@@ -136,6 +142,7 @@ public class Transaction {
 			}
 		}, new Action1<Throwable>() {
 			public void call(Throwable t) {
+				logger.info("Encountered error trying to dirty " + id, t);
 				t.printStackTrace();
 				state = TxState.ROLLBACKONLY;
 				errors.add(t);
@@ -182,24 +189,37 @@ public class Transaction {
 	}
 
 	public Observable<Throwable> prepare() {
-		System.out.println("In prepare(), state = " + state);
+		logger.info("In prepare(), state = " + state);
 		if (state == TxState.ROLLBACKONLY) {
-			unlockDirties();
-			return Observable.just(new TransactionFailedException(errors));
+			return latch.onReleased(5, TimeUnit.SECONDS).map(new Func1<Boolean, Throwable>() {
+				@Override
+				public Throwable call(Boolean t) {
+					unlockDirties();
+					return new TransactionFailedException(errors);
+				}
+			});
 		}
 		if (state != TxState.OPEN)
-			throw new InvalidTxStateException(state.toString());
+			return latch.onReleased(5, TimeUnit.SECONDS).map(new Func1<Boolean, Throwable>() {
+				@Override
+				public Throwable call(Boolean t) {
+					unlockDirties();
+					return new InvalidTxStateException(state.toString());
+				}
+			});
 		state = TxState.PREPARING;
 		latch.another();
 		txRecord.content().put("state", "prepared");
 		bucket.insert(JsonDocument.create(factory.lockPrefix()+txid, 15, JsonObject.create()));
 		bucket.insert(txRecord).subscribe(new Action1<JsonDocument>() {
 			public void call(JsonDocument t) {
-				System.out.println("inserted " + t);
+				logger.info("inserted tx: " + t);
 				latch.done();
 			}
 		}, new Action1<Throwable>() {
 			public void call(Throwable t) {
+				logger.info("error creating " + txid);
+				t.printStackTrace();
 				errors.add(0, t);
 				state = TxState.ROLLBACKONLY;
 				latch.done();
@@ -218,7 +238,7 @@ public class Transaction {
 	}
 	
 	private Observable<Throwable> doCommit() {
-		System.out.println("In doCommit");
+		logger.info("In doCommit");
 		state = TxState.COMMITTING;
 		List<Observable<?>> all = new ArrayList<Observable<?>>();
 		for (JsonDocument d : dirtied.values()) {
@@ -240,7 +260,7 @@ public class Transaction {
 		Func1<Throwable, Observable<Throwable>> checkThenCommit = new Func1<Throwable, Observable<Throwable>>() {
 			@Override
 			public Observable<Throwable> call(Throwable t) {
-				System.out.println("in CTC, t = " + t);
+				logger.info("in CTC, t = " + t);
 				if (t != null)
 					return Observable.just(t);
 				return doCommit();
@@ -258,13 +278,24 @@ public class Transaction {
 		if (state != TxState.OPEN && state != TxState.ROLLBACKONLY && state != TxState.PREPARED)
 			throw new InvalidTxStateException(state.toString());
 		state = TxState.ROLLBACKONLY;
-		bucket.remove(txRecord);
+		try {
+			bucket.remove(txRecord.id()).isEmpty().toBlocking().first();
+		} catch (DocumentDoesNotExistException ex) {
+			// That's OK ... didn't get to prepare
+		}
 		unlockDirties();
 	}
 
 	private void unlockDirties() {
-		for (JsonDocument x : dirtied.values())
-			bucket.unlock(x);
+		if (dirtied.isEmpty())
+			return;
+		logger.info("Unlocking dirties");
+		List<Observable<Boolean>> os = new ArrayList<Observable<Boolean>>();
+		for (JsonDocument x : dirtied.values()) {
+			logger.info("Unlocking " + x.id());
+			os.add(bucket.unlock(x));
+		}
+		Observable.merge(os).toBlocking().last();
 	}
 
 	// Assert according to our rules that the document has not changed since

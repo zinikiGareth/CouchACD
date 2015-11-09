@@ -10,6 +10,8 @@ import java.util.Date;
 import org.junit.AfterClass;
 import org.junit.BeforeClass;
 import org.junit.Test;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.ziniki.couch.acdtx.InvalidTxStateException;
 import org.ziniki.couch.acdtx.Transaction;
 import org.ziniki.couch.acdtx.TransactionFactory;
@@ -25,6 +27,7 @@ import com.couchbase.client.java.document.JsonDocument;
 import com.couchbase.client.java.document.json.JsonObject;
 
 public class ReallyBasicTests {
+	public static Logger logger = LoggerFactory.getLogger("Tests");
 	private static Bucket bucket;
 	private static Cluster cluster;
 	private static TransactionFactory factory;
@@ -32,9 +35,11 @@ public class ReallyBasicTests {
 
 	@BeforeClass
 	public static void start() throws Exception {
+		System.out.println("Flushing bucket");
 		cluster = CouchbaseCluster.create();
 		bucket = cluster.openBucket("default");
 		bucket.bucketManager().flush();
+		System.out.println("Bucket flushed");
 		factory = new TransactionFactory(bucket.async()) {
 			@Override
 			public String nextId() {
@@ -44,6 +49,7 @@ public class ReallyBasicTests {
 		JsonObject obj = JsonObject.create().put("type", "a").put("date", new Date().toString());
 		JsonDocument doc = JsonDocument.create("fred", obj);
 		bucket.upsert(doc);
+		System.out.println("Inserted fred");
 	}
 	
 	@AfterClass
@@ -85,7 +91,7 @@ public class ReallyBasicTests {
 		Transaction tx = factory.open();
 		tx.get("fred").subscribe();
 		checkForObservedException(tx.commit());
-		assertNotNull(bucket.get("tx1"));
+		assertNotNull(bucket.get(tx.id()));
 	}
 
 	@Test(expected=TransactionFailedException.class)
@@ -93,7 +99,6 @@ public class ReallyBasicTests {
 		Transaction tx = factory.open();
 		tx.get("bert").subscribe();
 		checkForObservedException(tx.commit());
-		assertNull(bucket.get("tx"));
 	}
 
 	@Test
@@ -123,10 +128,11 @@ public class ReallyBasicTests {
 	@Test
 	public void testWeCanRollbackATxByHandAsItWere() throws Exception {
 		Transaction tx = factory.open();
+		logger.info("Creating tx " + tx.id());
 		
-		Observable<JsonDocument> foo = tx.get("fred");
-		foo.subscribe(new Action1<JsonDocument>() {
+		tx.get("fred").subscribe(new Action1<JsonDocument>() {
 			public void call(JsonDocument fred) {
+				System.out.println("obtained fred " + fred.id());
 				fred.content().put("version", 2);
 				tx.dirty(fred);
 			}
@@ -135,8 +141,11 @@ public class ReallyBasicTests {
 				t.printStackTrace();
 			}
 		});
+		logger.info("Rolling back tx " + tx.id());
 		tx.rollback();
-		assertNull(bucket.get("tx4"));
+		logger.info("Rolled back tx " + tx.id());
+		assertNull(bucket.get(tx.id()));
+		logger.info("Checked for null " + tx.id());
 		JsonDocument readFred = bucket.get("fred");
 		assertNotNull(readFred);
 		assertNull(readFred.content().getInt("version"));
@@ -145,7 +154,8 @@ public class ReallyBasicTests {
 	@Test
 	public void testWeCanStillRollbackATxByHandAfterWeCallPrepare() throws Exception {
 		Transaction tx = factory.open();
-		
+		String id = tx.id();
+		System.out.println("Creating tx " + id);
 		Observable<JsonDocument> foo = tx.get("fred");
 		foo.subscribe(new Action1<JsonDocument>() {
 			public void call(JsonDocument fred) {
@@ -159,7 +169,7 @@ public class ReallyBasicTests {
 		});
 		checkForObservedException(tx.prepare());
 		tx.rollback();
-		assertNull(bucket.get("tx4"));
+		assertNull(bucket.get(id));
 		JsonDocument readFred = bucket.get("fred");
 		assertNotNull(readFred);
 		assertNull(readFred.content().getInt("version"));
