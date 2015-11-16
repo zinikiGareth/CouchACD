@@ -2,22 +2,25 @@ package org.ziniki.couch.acdtx;
 
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.TimeUnit;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-
-import rx.Observable;
-import rx.functions.Action0;
-import rx.functions.Action1;
-import rx.functions.Func1;
+import org.ziniki.couch.acdtx.AllDoneLatch.Latch;
 
 import com.couchbase.client.java.AsyncBucket;
 import com.couchbase.client.java.document.JsonDocument;
 import com.couchbase.client.java.document.json.JsonObject;
 import com.couchbase.client.java.error.DocumentDoesNotExistException;
+
+import rx.Observable;
+import rx.functions.Action0;
+import rx.functions.Action1;
+import rx.functions.Func1;
 
 /**
  * A Transaction is created by the TransactionFactory to represent one
@@ -45,7 +48,8 @@ public class Transaction {
 	private final String txid;
 	private final AsyncBucket bucket;
 	private final List<Throwable> errors = new ArrayList<Throwable>();
-	private final AllDoneLatch latch = new AllDoneLatch();
+	private AllDoneLatch latch = new AllDoneLatch();
+	private final Set<String> requestedDirty = new HashSet<String>();
 	private final Map<String, ReadDocument> alreadyRead = new HashMap<String, ReadDocument>();
 	private final Map<String, JsonDocument> dirtied = new HashMap<String, JsonDocument>();
 	private final JsonDocument txRecord;
@@ -53,8 +57,11 @@ public class Transaction {
 	public enum TxState { OPEN, ROLLBACKONLY, PREPARING, PREPARED, COMMITTING, COMMITTED };
 	
 	private TxState state = TxState.OPEN;
+	private Boolean sync = new Boolean(true);
+	private int request = 0;
 
-	Transaction(TransactionFactory factory, String txid, AsyncBucket bucket) {
+	public Transaction(TransactionFactory factory, String txid, AsyncBucket bucket) {
+		logger.info("Creating ACDTx " + txid);
 		this.factory = factory;
 		this.txid = txid;
 		this.bucket = bucket;
@@ -66,121 +73,150 @@ public class Transaction {
 		return txid;
 	}
 
-	public void hold() {
-		latch.another();
+	public Latch hold() {
+		int reqId;
+		synchronized (sync) { reqId = request++; }
+		return latch.another(txid + "_H_" + reqId);
 	}
 	
-	public void release() {
-		latch.done();
-	}
-	
-	public Observable<JsonDocument> get(String id) {
+	public Observable<JsonDocument> getOrNull(String id) {
 		if (alreadyRead.containsKey(id)) {
 			return Observable.just(alreadyRead.get(id).doc);
 		}
-		latch.another();
-		Observable<JsonDocument> ret = bucket.get(id).defaultIfEmpty(null);
-		return ret.filter(new Func1<JsonDocument, Boolean>() {
+		int reqId;
+		synchronized (sync) { reqId = request++; }
+		Latch l = latch.another(txid + "_G_" + reqId);
+		return bucket.get(id).defaultIfEmpty(null).doOnCompleted(new Action0() {
+			public void call() {
+				logger.info("calling release on " + l);
+				l.release();
+			}
+		});
+	}
+	
+	public Observable<JsonDocument> get(String id) {
+		return getOrNull(id).filter(new Func1<JsonDocument, Boolean>() {
 			@Override
 			public Boolean call(JsonDocument t) {
 				if (t == null) {
-					errors.add(new ObjectNotFoundException(id));
-					state = TxState.ROLLBACKONLY;
+					error(new ObjectNotFoundException(id));
 					return false;
 				} else {
 					alreadyRead.put(id, new ReadDocument(t.content().hashCode(), t));
 					return true;
 				}
 			}
-		}).doOnCompleted(new Action0() {
-			@Override
-			public void call() {
-				latch.done();
-			}
 		});
-
 	}
 	
-	public void dirty(JsonDocument doc) {
+	public synchronized void dirty(JsonDocument doc) {
 		if (state == TxState.ROLLBACKONLY) {
 			// this isn't going anywhere anyway, just don't bother
 			return;
 		}
 		String id = doc.id();
 		if (!alreadyRead.containsKey(id)) {
-			errors.add(new InvalidTxStateException("cannot dirty an unread object"));
-			state = TxState.ROLLBACKONLY;
+			error(new InvalidTxStateException("cannot dirty an unread object: " + id));
 			return;
 		}
-
-		if (dirtied.containsKey(id)) {
+		
+		if (requestedDirty.contains(id)) {
 			// we already have it locked; don't need to do that again
 			// we have to assume that the user always uses the same object; avoiding that would involve us in race issues
 			return;
 		}
+		requestedDirty.add(id);
 
-		latch.another();
+		int reqId;
+		synchronized (sync) { reqId = request++; }
+		Latch l = latch.another(txid + "_D_" + reqId);
 		bucket.getAndLock(id, 30).subscribe(new Action1<JsonDocument>() {
 			public void call(JsonDocument t) {
-				logger.info("Make object dirty: " + id);
-				try {
-					// CAS -1 means we could not obtain the lock
-					if (t.cas() == -1 || !assertUnchanged(t.id(), t.content())) {
-						state = TxState.ROLLBACKONLY;
-						errors.add(new ResourceChangedException("Resource " + id + " changed while attempting to lock"));
-						latch.done();
-						return;
+				synchronized(Transaction.this) {
+					logger.info("Make object dirty: " + id);
+					try {
+						// CAS -1 means we could not obtain the lock
+						if (t.cas() == -1 || !assertUnchanged(t.id(), t.content())) {
+							error(new ResourceChangedException("Resource " + id + " changed while attempting to lock"));
+							return;
+						}
+						recordAs(id, doc.content(), t.cas());
+						dirtied.put(id, JsonDocument.create(id, doc.content(), t.cas()));
+					} catch (Throwable t1) {
+						t1.printStackTrace();
+						error(t1);
 					}
-					recordAs(id, doc.content(), t.cas());
-					dirtied.put(id, JsonDocument.create(id, doc.content(), t.cas()));
-				} catch (Throwable t1) {
-					t1.printStackTrace();
-					state = TxState.ROLLBACKONLY;
-					errors.add(t1);
+					finally { l.release(); }
 				}
-				finally { latch.done(); }
 			}
 		}, new Action1<Throwable>() {
 			public void call(Throwable t) {
 				logger.info("Encountered error trying to dirty " + id, t);
 				t.printStackTrace();
-				state = TxState.ROLLBACKONLY;
-				errors.add(t);
-				latch.done();
+				error(t);
+				l.release();
 			}
 		});
 	}
 
-	public Observable<JsonDocument> newObject(String id, String type) {
+	public JsonDocument newObject(String id) {
 		if (state == TxState.ROLLBACKONLY) {
 			// this isn't going anywhere anyway, just don't bother
-			return Observable.from(new JsonDocument[] {});
+			return JsonDocument.create(id, JsonObject.create());
 		}
-		latch.another();
+
+		logger.info("Creating new object " + id);
+		
 		
 		// Write an empty object to the store to make sure that we grab it and obtain a CAS
-		JsonObject obj = JsonObject.empty();
-		JsonDocument doc = JsonDocument.create(id, obj);
-		bucket.insert(doc)
-			.subscribe(new Action1<JsonDocument>() {
-				public void call(JsonDocument t) {
-					latch.done();
-					dirtied.put(id, JsonDocument.create(id, obj, t.cas()));
-					recordAs(id, obj, t.cas());
-				}
-			}, new Action1<Throwable>() {
-				public void call(Throwable t) {
-					latch.done();
-					state = TxState.ROLLBACKONLY;
-					errors.add(t);
-				}
-			});
+		JsonDocument doc = push(id, JsonObject.empty());
+
+		// It is automatically dirtied in this tx
+		requestedDirty.add(id);
+
+		// It has already been "read"
+		alreadyRead.put(id, new ReadDocument(doc.content().hashCode(), doc));
 		
-		// Return the user the document we originally created
-		return Observable.just(doc);
+		return doc;
+	}
+
+	public JsonDocument push(String id, JsonObject obj) {
+		JsonDocument doc = JsonDocument.create(id, obj);
+		if (state == TxState.ROLLBACKONLY) {
+			// this isn't going anywhere anyway, just don't bother
+			return doc;
+		}
+		int reqId;
+		synchronized (sync) { reqId = request++; }
+		Latch l = latch.another(txid + "_P_" + reqId);
+		logger.info("Calling insert for id " + id);
+		bucket.insert(doc).subscribe(new Action1<JsonDocument>() {
+			public void call(JsonDocument t) {
+				logger.info("Putting object " + id + " in dirty state");
+				dirtied.put(id, JsonDocument.create(id, obj, t.cas()));
+				try {
+					recordAs(id, obj, t.cas());
+					l.release();
+				} catch (RuntimeException ex) {
+					logger.info("Exception recording " + txid + "_P_" + reqId);
+					throw ex;
+				}
+			}
+		}, new Action1<Throwable>() {
+			public void call(Throwable t) {
+				logger.info("Insert for id " + id + " failed", t);
+				l.release();
+				error(t);
+			}
+		});
+	
+		// Return the user the original document
+		return doc;
 	}
 
 	protected JsonObject recordAs(String id, JsonObject obj, long cas) {
+		if (state == TxState.PREPARING)
+			throw new RuntimeException("Invalid call to recordAs " + id);
 		JsonObject recordAs = JsonObject.create();
 		recordAs.put("doc", obj);
 		recordAs.put("cas", cas);
@@ -188,12 +224,23 @@ public class Transaction {
 		return recordAs;
 	}
 
+	public void await() {
+		if (!latch.onReleased(5, TimeUnit.SECONDS).toBlocking().first())
+			throw new TransactionTimeoutException();
+	}
+
+	public void relatch() {
+		latch = new AllDoneLatch();
+	}
+
 	public Observable<Throwable> prepare() {
-		logger.info("In prepare(), state = " + state);
+		logger.info("In prepare(" + txid +"), state = " + state);
 		if (state == TxState.ROLLBACKONLY) {
+			for (Throwable t : errors)
+				logger.error("Aborting because of", t);
 			return latch.onReleased(5, TimeUnit.SECONDS).map(new Func1<Boolean, Throwable>() {
 				@Override
-				public Throwable call(Boolean t) {
+				public Throwable call(Boolean b) {
 					unlockDirties();
 					return new TransactionFailedException(errors);
 				}
@@ -207,28 +254,37 @@ public class Transaction {
 					return new InvalidTxStateException(state.toString());
 				}
 			});
+		Boolean worked = latch.onReleased(5, TimeUnit.SECONDS).toBlocking().first();
+		if (!worked) {
+			unlockDirties();
+			return Observable.just(new TransactionTimeoutException());
+		}
+		AllDoneLatch platch = new AllDoneLatch();
 		state = TxState.PREPARING;
-		latch.another();
+		logger.info("In prepare(" + txid + "), latch released, state = " + state);
+		int reqId;
+		synchronized (sync) { reqId = request++; }
+		Latch l = platch.another(txid + "_X_" + reqId);
 		txRecord.content().put("state", "prepared");
 		bucket.insert(JsonDocument.create(factory.lockPrefix()+txid, 15, JsonObject.create()));
 		bucket.insert(txRecord).subscribe(new Action1<JsonDocument>() {
 			public void call(JsonDocument t) {
 				logger.info("inserted tx: " + t);
-				latch.done();
+				l.release();
 			}
 		}, new Action1<Throwable>() {
 			public void call(Throwable t) {
 				logger.info("error creating " + txid);
 				t.printStackTrace();
-				errors.add(0, t);
-				state = TxState.ROLLBACKONLY;
-				latch.done();
+				error(t);
+				l.release();
 			}
 		});
-		return latch.onReleased(5, TimeUnit.SECONDS).map(new Func1<Boolean, Throwable>() {
+		logger.info("In prepare(" + txid + "), wrote txRecord, state = " + state);
+		return platch.onReleased(5, TimeUnit.SECONDS).map(new Func1<Boolean, Throwable>() {
 			public Throwable call(Boolean t) {
 				if (!t)
-					errors.add(0, new TransactionTimeoutException());
+					error(new TransactionTimeoutException());
 				if (state == TxState.ROLLBACKONLY)
 					return new TransactionFailedException(errors);
 				state = TxState.PREPARED;
@@ -238,19 +294,22 @@ public class Transaction {
 	}
 	
 	private Observable<Throwable> doCommit() {
-		logger.info("In doCommit");
+		logger.info("In doCommit(" + txid +")");
 		state = TxState.COMMITTING;
 		List<Observable<?>> all = new ArrayList<Observable<?>>();
 		for (JsonDocument d : dirtied.values()) {
-//			all.add(bucket.unlock(d));
 			all.add(bucket.replace(d));
+			logger.info("Replaced " + d.id() + " with " + d);
 		}
+		logger.info("In doCommit(" + txid +"), initiated " + dirtied.size() + " writes");
 		return Observable.merge(all).count().map(new Func1<Integer, Throwable>() {
 			@Override
 			public Throwable call(Integer t) {
+				logger.info("Replaced " + t + " objects");
 				state = TxState.COMMITTED;
 				txRecord.content().put("state", "committed");
 				bucket.replace(txRecord);
+				// TODO: remove the lock record
 				return null;
 			}
 		});
@@ -308,7 +367,11 @@ public class Transaction {
 		String versionField = factory.versionField();
 		if (versionField == null)
 			return mine != null && mine.hash == newContent.hashCode();
-		return mine.doc.content().getBoolean(versionField).equals(newContent.get(versionField));
+		return mine.doc.content().get(versionField).equals(newContent.get(versionField));
 	}
 
+	public void error(Throwable t) {
+		state = TxState.ROLLBACKONLY;
+		errors.add(t);
+	}
 }

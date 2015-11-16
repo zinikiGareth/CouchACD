@@ -14,7 +14,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.ziniki.couch.acdtx.InvalidTxStateException;
 import org.ziniki.couch.acdtx.Transaction;
-import org.ziniki.couch.acdtx.TransactionFactory;
+import org.ziniki.couch.acdtx.BaseTransactionFactory;
 import org.ziniki.couch.acdtx.TransactionFailedException;
 
 import rx.Observable;
@@ -30,7 +30,7 @@ public class ReallyBasicTests {
 	public static Logger logger = LoggerFactory.getLogger("Tests");
 	private static Bucket bucket;
 	private static Cluster cluster;
-	private static TransactionFactory factory;
+	private static BaseTransactionFactory factory;
 	private static int id = 0;
 
 	@BeforeClass
@@ -40,7 +40,7 @@ public class ReallyBasicTests {
 		bucket = cluster.openBucket("default");
 		bucket.bucketManager().flush();
 		System.out.println("Bucket flushed");
-		factory = new TransactionFactory(bucket.async()) {
+		factory = new BaseTransactionFactory(bucket.async()) {
 			@Override
 			public String nextId() {
 				return "tx"+(++id);
@@ -72,16 +72,26 @@ public class ReallyBasicTests {
 	@Test
 	public void testWeCanCreateAnObject() throws Exception {
 		Transaction tx = factory.open();
-		tx.newObject("joe", "user");
+		tx.newObject("joe");
 		checkForObservedException(tx.commit());
 		assertNotNull(bucket.get(tx.id()));
 		assertNotNull(bucket.get("joe"));
 	}
 
+	@Test
+	public void testWeCanCreateAnObjectThenDirtyItInTheSameTx() throws Exception {
+		Transaction tx = factory.open();
+		JsonDocument doc = tx.newObject("henry");
+		tx.dirty(doc);
+		checkForObservedException(tx.commit());
+		assertNotNull(bucket.get(tx.id()));
+		assertNotNull(bucket.get("henry"));
+	}
+
 	@Test(expected=TransactionFailedException.class)
 	public void testWeCannotCreateAnObjectWhichAlreadyExists() throws Exception {
 		Transaction tx = factory.open();
-		tx.newObject("fred", "user");
+		tx.newObject("fred");
 		checkForObservedException(tx.commit());
 		assertNull(bucket.get("tx"));
 	}
@@ -192,5 +202,14 @@ public class ReallyBasicTests {
 		});
 		checkForObservedException(tx.commit());
 		tx.rollback();
+	}
+	
+	@Test(expected=TransactionFailedException.class)
+	public void testPrepareWillFailIfWeNeverUnlatch() throws Throwable {
+		Transaction tx = factory.open();
+		tx.hold();
+		Throwable t = tx.commit().toBlocking().first();
+		if (t != null)
+			throw t;
 	}
 }

@@ -7,15 +7,62 @@ import rx.Observable;
 import rx.Subscriber;
 
 public class AllDoneLatch {
+	public class Latch {
+		private boolean released;
+		private final String id;
+
+		private Latch(String id) {
+			this.id = id;
+			this.released = false;
+		}
+		
+		public void release() {
+			System.err.println("attempting to release latch " + id);
+			synchronized (this) {
+				if (!released) {
+					AllDoneLatch.this.done(id);
+					released = true;
+				}
+			}
+		}
+		
+		@Override
+		public String toString() {
+			return "Latch[" + id + "]";
+		}
+	}
+
+	private boolean allReleased;
 	private int requests = 0;
 	private int completed = 0;
 	
-	public synchronized void another() {
+	public synchronized Latch another(String id) {
 		requests++;
+		System.err.println(id + " another: " + completed + "/" + requests);
+		try {
+			throw new RuntimeException("latched " + completed + "/" + requests);
+		} catch (Exception ex) {
+			ex.printStackTrace();
+		}
+		if (allReleased) {
+			System.err.println("Attempting to latch after released");
+			System.exit(12);
+		}
+		return new Latch(id);
 	}
 
-	public synchronized void done() {
+	private synchronized void done(String id) {
 		completed++;
+		System.err.println(id + " done: " + completed + "/" + requests);
+//		try {
+//			throw new RuntimeException("released " + completed + "/" + requests);
+//		} catch (Exception ex) {
+//			ex.printStackTrace();
+//		}
+		if (completed > requests) {
+			System.err.println("Attempting to complete when none outstanding");
+			System.exit(12);
+		}
 		this.notify();
 	}
 
@@ -23,14 +70,23 @@ public class AllDoneLatch {
 		long waitms = TimeUnit.MILLISECONDS.convert(amt, unit);
 		long until = new Date().getTime()+waitms;
 		synchronized (this) {
+			try {
+				throw new RuntimeException("awaiting release: " + completed + "/" + requests);
+			} catch (Exception ex) {
+				ex.printStackTrace();
+			}
 			while (requests > completed && new Date().getTime() < until) {
 				try {
 					long waitFor = until-new Date().getTime();
+					System.err.println("Waiting because " + requests + " > " + completed + " for " + waitFor);
 					this.wait(waitFor);
+					System.err.println("notified: " + requests + " == " + completed);
 				} catch (InterruptedException ex) {
 					// ignore this
 				}
 			}
+			System.err.println("releasing with " + completed + "/" + requests + ": " + (completed == requests));
+			this.allReleased = (requests == completed);
 			return requests == completed;
 		}
 	}
