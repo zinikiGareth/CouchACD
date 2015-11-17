@@ -18,7 +18,8 @@ import com.couchbase.client.java.document.json.JsonObject;
 import com.couchbase.client.java.error.DocumentDoesNotExistException;
 
 import rx.Observable;
-import rx.functions.Action0;
+import rx.Observable.OnSubscribe;
+import rx.Subscriber;
 import rx.functions.Action1;
 import rx.functions.Func1;
 
@@ -61,7 +62,7 @@ public class Transaction {
 	private int request = 0;
 
 	public Transaction(TransactionFactory factory, String txid, AsyncBucket bucket) {
-		logger.info("Creating ACDTx " + txid);
+//		logger.info("Creating ACDTx " + txid);
 		this.factory = factory;
 		this.txid = txid;
 		this.bucket = bucket;
@@ -83,15 +84,60 @@ public class Transaction {
 		if (alreadyRead.containsKey(id)) {
 			return Observable.just(alreadyRead.get(id).doc);
 		}
+		List<Object> holdingPen = new ArrayList<Object>(); 
+
 		int reqId;
 		synchronized (sync) { reqId = request++; }
 		Latch l = latch.another(txid + "_G_" + reqId);
-		return bucket.get(id).defaultIfEmpty(null).doOnCompleted(new Action0() {
-			public void call() {
-				logger.info("calling release on " + l);
+		bucket.get(id).defaultIfEmpty(null).subscribe(doc -> {
+			synchronized (holdingPen) {
+				holdingPen.add(doc);
+				holdingPen.notifyAll();
+				l.release();
+			}
+		}, err -> {
+			synchronized (holdingPen) {
+				holdingPen.add(err);
+				holdingPen.notifyAll();
 				l.release();
 			}
 		});
+
+		OnSubscribe<JsonDocument> readit = new OnSubscribe<JsonDocument>() {
+			public void call(Subscriber<? super JsonDocument> s) {
+				synchronized (holdingPen) {
+					while (holdingPen.isEmpty() && !s.isUnsubscribed()) {
+						SyncUtils.waitFor(holdingPen, 150);
+					}
+					if (s.isUnsubscribed())
+						return;
+					Object o = holdingPen.get(0);
+					if (o instanceof Throwable)
+						s.onError((Throwable) o);
+					else {
+						s.onNext((JsonDocument) o);
+						s.onCompleted();
+					}
+				}
+			}
+		};
+		List<Latch> subscriptions = new ArrayList<Latch>();
+		return Observable.create(readit).
+			doOnSubscribe(() -> { synchronized(subscriptions) { Latch q = latch.another(l.toString() + "_" + subscriptions.size()); subscriptions.add(q); /*System.err.println("S " + q);*/ }}).
+			doOnUnsubscribe(() -> { synchronized(subscriptions) {
+				for (int i=0;i<subscriptions.size();i++) {
+					Latch m = subscriptions.get(i);
+					if (m != null) {
+//						System.err.println("U " + m);
+						m.release();
+						subscriptions.set(i, null);
+						return;
+					}
+				}
+				System.out.println("Not enough subscriptions to close");
+				System.exit(51);
+			}
+			});
 	}
 	
 	public Observable<JsonDocument> get(String id) {
@@ -133,7 +179,7 @@ public class Transaction {
 		bucket.getAndLock(id, 30).subscribe(new Action1<JsonDocument>() {
 			public void call(JsonDocument t) {
 				synchronized(Transaction.this) {
-					logger.info("Make object dirty: " + id);
+//					logger.info("Make object dirty: " + id);
 					try {
 						// CAS -1 means we could not obtain the lock
 						if (t.cas() == -1 || !assertUnchanged(t.id(), t.content())) {
@@ -165,7 +211,7 @@ public class Transaction {
 			return JsonDocument.create(id, JsonObject.create());
 		}
 
-		logger.info("Creating new object " + id);
+//		logger.info("Creating new object " + id);
 		
 		
 		// Write an empty object to the store to make sure that we grab it and obtain a CAS
@@ -189,10 +235,10 @@ public class Transaction {
 		int reqId;
 		synchronized (sync) { reqId = request++; }
 		Latch l = latch.another(txid + "_P_" + reqId);
-		logger.info("Calling insert for id " + id);
+//		logger.info("Calling insert for id " + id);
 		bucket.insert(doc).subscribe(new Action1<JsonDocument>() {
 			public void call(JsonDocument t) {
-				logger.info("Putting object " + id + " in dirty state");
+//				logger.info("Putting object " + id + " in dirty state");
 				dirtied.put(id, JsonDocument.create(id, obj, t.cas()));
 				try {
 					recordAs(id, obj, t.cas());
@@ -234,7 +280,7 @@ public class Transaction {
 	}
 
 	public Observable<Throwable> prepare() {
-		logger.info("In prepare(" + txid +"), state = " + state);
+//		logger.info("In prepare(" + txid +"), state = " + state);
 		if (state == TxState.ROLLBACKONLY) {
 			for (Throwable t : errors)
 				logger.error("Aborting because of", t);
@@ -261,7 +307,7 @@ public class Transaction {
 		}
 		AllDoneLatch platch = new AllDoneLatch();
 		state = TxState.PREPARING;
-		logger.info("In prepare(" + txid + "), latch released, state = " + state);
+//		logger.info("In prepare(" + txid + "), latch released, state = " + state);
 		int reqId;
 		synchronized (sync) { reqId = request++; }
 		Latch l = platch.another(txid + "_X_" + reqId);
@@ -269,7 +315,7 @@ public class Transaction {
 		bucket.insert(JsonDocument.create(factory.lockPrefix()+txid, 15, JsonObject.create()));
 		bucket.insert(txRecord).subscribe(new Action1<JsonDocument>() {
 			public void call(JsonDocument t) {
-				logger.info("inserted tx: " + t);
+//				logger.info("inserted tx: " + t);
 				l.release();
 			}
 		}, new Action1<Throwable>() {
@@ -280,7 +326,7 @@ public class Transaction {
 				l.release();
 			}
 		});
-		logger.info("In prepare(" + txid + "), wrote txRecord, state = " + state);
+//		logger.info("In prepare(" + txid + "), wrote txRecord, state = " + state);
 		return platch.onReleased(5, TimeUnit.SECONDS).map(new Func1<Boolean, Throwable>() {
 			public Throwable call(Boolean t) {
 				if (!t)
@@ -294,18 +340,18 @@ public class Transaction {
 	}
 	
 	private Observable<Throwable> doCommit() {
-		logger.info("In doCommit(" + txid +")");
+//		logger.info("In doCommit(" + txid +")");
 		state = TxState.COMMITTING;
 		List<Observable<?>> all = new ArrayList<Observable<?>>();
 		for (JsonDocument d : dirtied.values()) {
 			all.add(bucket.replace(d));
-			logger.info("Replaced " + d.id() + " with " + d);
+//			logger.info("Replaced " + d.id() + " with " + d);
 		}
-		logger.info("In doCommit(" + txid +"), initiated " + dirtied.size() + " writes");
+//		logger.info("In doCommit(" + txid +"), initiated " + dirtied.size() + " writes");
 		return Observable.merge(all).count().map(new Func1<Integer, Throwable>() {
 			@Override
 			public Throwable call(Integer t) {
-				logger.info("Replaced " + t + " objects");
+//				logger.info("Replaced " + t + " objects");
 				state = TxState.COMMITTED;
 				txRecord.content().put("state", "committed");
 				bucket.replace(txRecord);
