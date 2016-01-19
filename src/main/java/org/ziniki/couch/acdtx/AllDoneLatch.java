@@ -1,6 +1,8 @@
 package org.ziniki.couch.acdtx;
 
 import java.util.Date;
+import java.util.Set;
+import java.util.TreeSet;
 import java.util.concurrent.TimeUnit;
 
 import rx.Observable;
@@ -34,12 +36,14 @@ public class AllDoneLatch {
 	private boolean allReleased;
 	private int requests = 0;
 	private int completed = 0;
+	private Set<String> outstanding = new TreeSet<String>();
 	
 	public synchronized Latch another(String id) {
 		requests++;
 //		System.err.println(id + " another: " + completed + "/" + requests);
+//		if (id.endsWith("_H_16") || id.endsWith("_H_18"))
 //		try {
-//			throw new RuntimeException("latched " + completed + "/" + requests);
+//			throw new RuntimeException("latched " + id + ": " + completed + "/" + requests);
 //		} catch (Exception ex) {
 //			ex.printStackTrace();
 //		}
@@ -47,11 +51,14 @@ public class AllDoneLatch {
 			System.err.println("Attempting to latch after released");
 			System.exit(12);
 		}
+		outstanding.add(id);
 		return new Latch(id);
 	}
 
 	private synchronized void done(String id) {
 		completed++;
+		if (!outstanding.remove(id))
+			throw new RuntimeException("Was not waiting for " + id);
 //		System.err.println(id + " done: " + completed + "/" + requests);
 //		try {
 //			throw new RuntimeException("released " + completed + "/" + requests);
@@ -86,6 +93,8 @@ public class AllDoneLatch {
 			}
 //			System.err.println("releasing with " + completed + "/" + requests + ": " + (completed == requests));
 			this.allReleased = (requests == completed);
+			if (!this.allReleased)
+				System.out.println("Still waiting for " + this.outstanding);
 			return requests == completed;
 		}
 	}

@@ -50,7 +50,9 @@ public class Transaction {
 	private final AsyncBucket bucket;
 	private final List<Throwable> errors = new ArrayList<Throwable>();
 	private AllDoneLatch latch = new AllDoneLatch();
+	private final Set<String> brandNew = new HashSet<String>();
 	private final Set<String> requestedDirty = new HashSet<String>();
+	private final Map<String, Observable<JsonDocument>> currentlyReading = new HashMap<String, Observable<JsonDocument>>();
 	private final Map<String, ReadDocument> alreadyRead = new HashMap<String, ReadDocument>();
 	private final Map<String, JsonDocument> dirtied = new HashMap<String, JsonDocument>();
 	private final JsonDocument txRecord;
@@ -81,23 +83,40 @@ public class Transaction {
 	}
 	
 	public Observable<JsonDocument> getOrNull(String id) {
-		if (alreadyRead.containsKey(id)) {
-			return Observable.just(alreadyRead.get(id).doc);
+		ReadDocument holdingPen = new ReadDocument(id); 
+		synchronized (alreadyRead) {
+			if (id.endsWith("_contents_0")) {
+				System.out.println("Have: " + alreadyRead.keySet());
+				System.out.println("Looking for " + id + ": " + alreadyRead.containsKey(id));
+			}
+			if (alreadyRead.containsKey(id)) {
+				ReadDocument ct = alreadyRead.get(id);
+				JsonDocument send = ct.doc;
+				System.out.println("Sending along " + send);
+				if (ct.missing || send != null)
+					return Observable.just(send);
+				else {
+					return currentlyReading.get(id);
+				}
+			}
+			alreadyRead.put(id, holdingPen);
 		}
-		List<Object> holdingPen = new ArrayList<Object>(); 
 
 		int reqId;
 		synchronized (sync) { reqId = request++; }
 		Latch l = latch.another(txid + "_G_" + reqId);
 		bucket.get(id).defaultIfEmpty(null).subscribe(doc -> {
 			synchronized (holdingPen) {
-				holdingPen.add(doc);
+				if (doc == null)
+					holdingPen.missing = true;
+				else
+					holdingPen.setDocument(doc);
 				holdingPen.notifyAll();
 				l.release();
 			}
 		}, err -> {
 			synchronized (holdingPen) {
-				holdingPen.add(err);
+				holdingPen.error(err);
 				holdingPen.notifyAll();
 				l.release();
 			}
@@ -111,18 +130,17 @@ public class Transaction {
 					}
 					if (s.isUnsubscribed())
 						return;
-					Object o = holdingPen.get(0);
-					if (o instanceof Throwable)
-						s.onError((Throwable) o);
+					if (holdingPen.err != null)
+						s.onError(holdingPen.err);
 					else {
-						s.onNext((JsonDocument) o);
+						s.onNext(holdingPen.doc);
 						s.onCompleted();
 					}
 				}
 			}
 		};
 		List<Latch> subscriptions = new ArrayList<Latch>();
-		return Observable.create(readit).
+		Observable<JsonDocument> ret = Observable.create(readit).
 			doOnSubscribe(() -> { synchronized(subscriptions) { Latch q = latch.another(l.toString() + "_" + subscriptions.size()); subscriptions.add(q); /*System.err.println("S " + q);*/ }}).
 			doOnUnsubscribe(() -> { synchronized(subscriptions) {
 				for (int i=0;i<subscriptions.size();i++) {
@@ -131,6 +149,7 @@ public class Transaction {
 //						System.err.println("U " + m);
 						m.release();
 						subscriptions.set(i, null);
+						synchronized (holdingPen) { holdingPen.notifyAll(); }
 						return;
 					}
 				}
@@ -138,6 +157,8 @@ public class Transaction {
 				System.exit(51);
 			}
 			});
+		currentlyReading.put(id, ret);
+		return ret;
 	}
 	
 	public Observable<JsonDocument> get(String id) {
@@ -145,10 +166,12 @@ public class Transaction {
 			@Override
 			public Boolean call(JsonDocument t) {
 				if (t == null) {
-					error(new ObjectNotFoundException(id));
-					return false;
+					System.out.println("Failed to find " + id);
+					ObjectNotFoundException ret = new ObjectNotFoundException(id);
+					error(ret);
+					throw ret;
+//					return false;
 				} else {
-					alreadyRead.put(id, new ReadDocument(t.content().hashCode(), t));
 					return true;
 				}
 			}
@@ -180,6 +203,8 @@ public class Transaction {
 			public void call(JsonDocument t) {
 				synchronized(Transaction.this) {
 //					logger.info("Make object dirty: " + id);
+					if (t == null)
+						throw new RuntimeException("Found null in dirty(" + id +")");
 					try {
 						// CAS -1 means we could not obtain the lock
 						if (t.cas() == -1 || !assertUnchanged(t.id(), t.content())) {
@@ -211,17 +236,21 @@ public class Transaction {
 			return JsonDocument.create(id, JsonObject.create());
 		}
 
-//		logger.info("Creating new object " + id);
+		logger.info("Creating new object " + id);
 		
 		
 		// Write an empty object to the store to make sure that we grab it and obtain a CAS
 		JsonDocument doc = push(id, JsonObject.empty());
 
 		// It is automatically dirtied in this tx
+		brandNew.add(id);
 		requestedDirty.add(id);
 
 		// It has already been "read"
-		alreadyRead.put(id, new ReadDocument(doc.content().hashCode(), doc));
+		ReadDocument ret = new ReadDocument(id);
+		ret.setDocument(doc);
+		alreadyRead.put(id, ret);
+		System.out.println("doc = " + ret.doc);
 		
 		return doc;
 	}
@@ -271,7 +300,7 @@ public class Transaction {
 	}
 
 	public void await() {
-		if (!latch.onReleased(5, TimeUnit.SECONDS).toBlocking().first())
+		if (!latch.onReleased(15, TimeUnit.SECONDS).toBlocking().first())
 			throw new TransactionTimeoutException();
 	}
 
@@ -392,13 +421,17 @@ public class Transaction {
 	}
 
 	private void unlockDirties() {
-		if (dirtied.isEmpty())
+		if (dirtied.isEmpty() && brandNew.isEmpty())
 			return;
 		logger.info("Unlocking dirties");
 		List<Observable<Boolean>> os = new ArrayList<Observable<Boolean>>();
 		for (JsonDocument x : dirtied.values()) {
 			logger.info("Unlocking " + x.id());
-			os.add(bucket.unlock(x));
+			os.add(bucket.unlock(x).onErrorReturn(err -> true));
+		}
+		for (String x : brandNew) {
+			logger.info("Deleting " + x);
+			os.add(bucket.remove(x).map(r -> true).onErrorReturn(err -> true));
 		}
 		Observable.merge(os).toBlocking().last();
 	}
@@ -411,13 +444,17 @@ public class Transaction {
 		ReadDocument mine = alreadyRead.get(id);
 
 		String versionField = factory.versionField();
-		if (versionField == null)
+		Object oldV = mine.doc.content().get(versionField);
+		System.err.println("id = " + id + " vf = " + versionField + " oldV = " + oldV + " mine = " + mine + " mh = " + (mine == null?"N/A":mine.hash) + " nc = " + newContent.hashCode() + " mine = " + (mine == null ? "N/A" : mine.doc.content()) + " new = " + newContent);
+		if (versionField == null || oldV == null)
 			return mine != null && mine.hash == newContent.hashCode();
-		return mine.doc.content().get(versionField).equals(newContent.get(versionField));
+		Object newV = newContent.get(versionField);
+		return oldV.equals(newV);
 	}
 
 	public void error(Throwable t) {
 		state = TxState.ROLLBACKONLY;
 		errors.add(t);
+		logger.info("Marked tx " + txid + " rollback only with error " + t);
 	}
 }
