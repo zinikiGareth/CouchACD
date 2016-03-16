@@ -12,8 +12,8 @@
 	</classpathentry>
 	<classpathentry kind="con" path="org.eclipse.jdt.junit.JUNIT_CONTAINER/4"/>
 	<classpathentry kind="lib" path="/utils-qb/mvncache/org/slf4j/slf4j-api/1.7.5/slf4j-api-1.7.5.jar"/>
-	<classpathentry kind="lib" path="/CouchACDSupport/libs/core-io-1.2.1.jar"/>
-	<classpathentry kind="lib" path="/CouchACDSupport/libs/java-client-2.2.1.jar"/>
-	<classpathentry kind="lib" path="/CouchACDSupport/libs/rxjava-1.0.15.jar"/>
+	<classpathentry kind="lib" path="/CouchACDSupport/libs/core-io-1.2.5.jar"/>
+	<classpathentry kind="lib" path="/CouchACDSupport/libs/java-client-2.2.5.jar"/>
+	<classpathentry kind="lib" path="/CouchACDSupport/libs/rxjava-1.1.1.jar"/>
 	<classpathentry kind="output" path="bin"/>
 </classpath>

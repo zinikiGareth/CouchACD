@@ -41,14 +41,21 @@ public class AllDoneLatch {
 	public synchronized Latch another(String id) {
 		requests++;
 //		System.err.println(id + " another: " + completed + "/" + requests);
-//		if (id.endsWith("_H_16") || id.endsWith("_H_18"))
-//		try {
-//			throw new RuntimeException("latched " + id + ": " + completed + "/" + requests);
-//		} catch (Exception ex) {
-//			ex.printStackTrace();
-//		}
+		/*
+		if (id.endsWith("_G_0"))
+		try {
+			throw new RuntimeException("latched " + id + ": " + completed + "/" + requests);
+		} catch (Exception ex) {
+			ex.printStackTrace(System.out);
+		}
+		*/
 		if (allReleased) {
-			System.err.println("Attempting to latch after released");
+			try {
+				throw new RuntimeException("Attempting to latch " + id + " after tx released");
+			} catch (Exception ex) {
+				ex.printStackTrace();
+			}
+			System.err.println("Attempting to latch " + id + " after tx released");
 			System.exit(12);
 		}
 		outstanding.add(id);
@@ -56,15 +63,17 @@ public class AllDoneLatch {
 	}
 
 	private synchronized void done(String id) {
+		/*
+		if (id.endsWith("_G_1"))
+		try {
+			throw new RuntimeException("released " + completed + "/" + requests);
+		} catch (Exception ex) {
+			ex.printStackTrace(System.out);
+		}
+		*/
 		completed++;
 		if (!outstanding.remove(id))
-			throw new RuntimeException("Was not waiting for " + id);
-//		System.err.println(id + " done: " + completed + "/" + requests);
-//		try {
-//			throw new RuntimeException("released " + completed + "/" + requests);
-//		} catch (Exception ex) {
-//			ex.printStackTrace();
-//		}
+			throw new RuntimeException("Was not waiting for " + id + " have " + outstanding);
 		if (completed > requests) {
 			System.err.println("Attempting to complete when none outstanding");
 			System.exit(12);

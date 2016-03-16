@@ -5,6 +5,7 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Map.Entry;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
 
@@ -18,8 +19,6 @@ import com.couchbase.client.java.document.json.JsonObject;
 import com.couchbase.client.java.error.DocumentDoesNotExistException;
 
 import rx.Observable;
-import rx.Observable.OnSubscribe;
-import rx.Subscriber;
 import rx.functions.Action1;
 import rx.functions.Func1;
 
@@ -52,16 +51,18 @@ public class Transaction {
 	private AllDoneLatch latch = new AllDoneLatch();
 	private final Set<String> brandNew = new HashSet<String>();
 	private final Set<String> requestedDirty = new HashSet<String>();
-	private final Map<String, Observable<JsonDocument>> currentlyReading = new HashMap<String, Observable<JsonDocument>>();
 	private final Map<String, ReadDocument> alreadyRead = new HashMap<String, ReadDocument>();
 	private final Map<String, JsonDocument> dirtied = new HashMap<String, JsonDocument>();
+	private final Map<String, JsonDocument> toRemove = new HashMap<String, JsonDocument>();
 	private final JsonDocument txRecord;
 
+	
 	public enum TxState { OPEN, ROLLBACKONLY, PREPARING, PREPARED, COMMITTING, COMMITTED };
 	
 	private TxState state = TxState.OPEN;
 	private Boolean sync = new Boolean(true);
 	private int request = 0;
+//	public final Scheduler myScheduler = Schedulers.newThread();
 
 	public Transaction(TransactionFactory factory, String txid, AsyncBucket bucket) {
 //		logger.info("Creating ACDTx " + txid);
@@ -85,36 +86,32 @@ public class Transaction {
 	public Observable<JsonDocument> getOrNull(String id) {
 		ReadDocument holdingPen = new ReadDocument(id); 
 		synchronized (alreadyRead) {
-			if (id.endsWith("_contents_0")) {
-				System.out.println("Have: " + alreadyRead.keySet());
-				System.out.println("Looking for " + id + ": " + alreadyRead.containsKey(id));
-			}
 			if (alreadyRead.containsKey(id)) {
 				ReadDocument ct = alreadyRead.get(id);
 				JsonDocument send = ct.doc;
-				System.out.println("Sending along " + send);
 				if (ct.missing || send != null)
 					return Observable.just(send);
-				else {
-					return currentlyReading.get(id);
-				}
-			}
-			alreadyRead.put(id, holdingPen);
+			} else
+				alreadyRead.put(id, holdingPen);
 		}
 
 		int reqId;
 		synchronized (sync) { reqId = request++; }
+//		System.out.println("Request " + reqId + " is for " + id + " with holding pen " + holdingPen);
+//		try { throw new RuntimeException("Request " + reqId + " is for " + id + " with holding pen " + holdingPen); } catch (RuntimeException ex) { ex.printStackTrace(System.out); }
+
 		Latch l = latch.another(txid + "_G_" + reqId);
-		bucket.get(id).defaultIfEmpty(null).subscribe(doc -> {
-			synchronized (holdingPen) {
-				if (doc == null)
-					holdingPen.missing = true;
-				else
-					holdingPen.setDocument(doc);
-				holdingPen.notifyAll();
-				l.release();
-			}
-		}, err -> {
+//				System.out.println("Scheduler is " + myScheduler);
+		return bucket.get(id).defaultIfEmpty(null).map(doc -> {
+			if (doc == null)
+				holdingPen.missing = true;
+			else
+				holdingPen.setDocument(doc);
+			l.release();
+			return doc;
+		}).cache();
+		/*
+		, err -> {
 			synchronized (holdingPen) {
 				holdingPen.error(err);
 				holdingPen.notifyAll();
@@ -126,7 +123,12 @@ public class Transaction {
 			public void call(Subscriber<? super JsonDocument> s) {
 				synchronized (holdingPen) {
 					while (holdingPen.isEmpty() && !s.isUnsubscribed()) {
-						SyncUtils.waitFor(holdingPen, 150);
+//						SyncUtils.waitFor(holdingPen, 150);
+						SyncUtils.waitFor(holdingPen, 1500);
+						if (holdingPen.isEmpty()) {
+							System.out.println("Still waiting for " + l);
+							try { throw new RuntimeException("Still waiting for " + l); } catch (RuntimeException ex) { ex.printStackTrace(); }
+						}
 					}
 					if (s.isUnsubscribed())
 						return;
@@ -141,7 +143,12 @@ public class Transaction {
 		};
 		List<Latch> subscriptions = new ArrayList<Latch>();
 		Observable<JsonDocument> ret = Observable.create(readit).
-			doOnSubscribe(() -> { synchronized(subscriptions) { Latch q = latch.another(l.toString() + "_" + subscriptions.size()); subscriptions.add(q); /*System.err.println("S " + q);*/ }}).
+			doOnSubscribe(() -> { 
+				if (state != TxState.OPEN) return;
+				synchronized(subscriptions) {
+					Latch q = latch.another(l.toString() + "_" + subscriptions.size());
+					subscriptions.add(q);
+			}}).
 			doOnUnsubscribe(() -> { synchronized(subscriptions) {
 				for (int i=0;i<subscriptions.size();i++) {
 					Latch m = subscriptions.get(i);
@@ -153,12 +160,15 @@ public class Transaction {
 						return;
 					}
 				}
-				System.out.println("Not enough subscriptions to close");
-				System.exit(51);
+				if (state == TxState.OPEN) {
+					System.out.println("Not enough subscriptions to close");
+					System.exit(51);
+				}
 			}
 			});
 		currentlyReading.put(id, ret);
 		return ret;
+		*/
 	}
 	
 	public Observable<JsonDocument> get(String id) {
@@ -192,6 +202,8 @@ public class Transaction {
 		if (requestedDirty.contains(id)) {
 			// we already have it locked; don't need to do that again
 			// we have to assume that the user always uses the same object; avoiding that would involve us in race issues
+			if (doc != alreadyRead.get(id).doc)
+				throw new InvalidTxStateException("You cannot use two different objects for the same ID in the same TX");
 			return;
 		}
 		requestedDirty.add(id);
@@ -250,7 +262,6 @@ public class Transaction {
 		ReadDocument ret = new ReadDocument(id);
 		ret.setDocument(doc);
 		alreadyRead.put(id, ret);
-		System.out.println("doc = " + ret.doc);
 		
 		return doc;
 	}
@@ -264,21 +275,31 @@ public class Transaction {
 		int reqId;
 		synchronized (sync) { reqId = request++; }
 		Latch l = latch.another(txid + "_P_" + reqId);
+		TransactionFailedException uex;
+		try {
+			throw new TransactionFailedException("Inserting " + id + " failed");
+		} catch (TransactionFailedException ex) {
+			uex = ex;
+		}
 //		logger.info("Calling insert for id " + id);
 		bucket.insert(doc).subscribe(new Action1<JsonDocument>() {
 			public void call(JsonDocument t) {
-//				logger.info("Putting object " + id + " in dirty state");
-				dirtied.put(id, JsonDocument.create(id, obj, t.cas()));
-				try {
-					recordAs(id, obj, t.cas());
-					l.release();
-				} catch (RuntimeException ex) {
-					logger.info("Exception recording " + txid + "_P_" + reqId);
-					throw ex;
+//				logger.info("Putting object " + id + " in dirty state ... need to grab lock");
+				synchronized (Transaction.this) {
+//					logger.info("Have lock to dirty " + id);
+					dirtied.put(id, JsonDocument.create(id, obj, t.cas()));
+					try {
+						recordAs(id, obj, t.cas());
+						l.release();
+					} catch (RuntimeException ex) {
+						logger.info("Exception recording " + txid + "_P_" + reqId);
+						throw ex;
+					}
 				}
 			}
 		}, new Action1<Throwable>() {
 			public void call(Throwable t) {
+				logger.info("Attempt to insert failed", uex);
 				logger.info("Insert for id " + id + " failed", t);
 				l.release();
 				error(t);
@@ -287,6 +308,40 @@ public class Transaction {
 	
 		// Return the user the original document
 		return doc;
+	}
+
+
+	public void delete(String id) {
+		if (state == TxState.ROLLBACKONLY) {
+			// this isn't going anywhere anyway, just don't bother
+			return;
+		}
+		int reqId;
+		synchronized (sync) { reqId = request++; }
+
+		if (requestedDirty.contains(id)) {
+			// we already have it locked; can't do that again
+			// find locked document and add that to list to delete
+			if (!toRemove.containsKey(id))
+				toRemove.put(id, dirtied.get(id));
+			return;
+		}
+		requestedDirty.add(id);
+		
+		Latch l = latch.another(txid + "_D_" + reqId);
+		bucket.getAndLock(id, 30).subscribe(new Action1<JsonDocument>() {
+			public void call(JsonDocument t) {
+				toRemove.put(id, t);
+				l.release();
+			}
+		}, new Action1<Throwable>() {
+			public void call(Throwable t) {
+				logger.info("Encountered error trying to delete " + id, t);
+				t.printStackTrace();
+				error(t);
+				l.release();
+			}
+		});
 	}
 
 	protected JsonObject recordAs(String id, JsonObject obj, long cas) {
@@ -300,6 +355,8 @@ public class Transaction {
 	}
 
 	public void await() {
+		if (Thread.currentThread().getName().startsWith("cb-"))
+			throw new TransactionFailedException("Cannot prepare or commit tx from a couchbase worker thread");
 		if (!latch.onReleased(15, TimeUnit.SECONDS).toBlocking().first())
 			throw new TransactionTimeoutException();
 	}
@@ -369,39 +426,44 @@ public class Transaction {
 	}
 	
 	private Observable<Throwable> doCommit() {
-//		logger.info("In doCommit(" + txid +")");
+//		try { throw new RuntimeException("In commit " + txid); } catch (RuntimeException ex) { ex.printStackTrace(System.out); }
+		logger.info("In doCommit(" + txid +")");
 		state = TxState.COMMITTING;
 		List<Observable<?>> all = new ArrayList<Observable<?>>();
 		for (JsonDocument d : dirtied.values()) {
-			all.add(bucket.replace(d));
-//			logger.info("Replaced " + d.id() + " with " + d);
+			if (toRemove.containsKey(d.id()))
+				continue;
+			all.add(bucket.replace(d).timeout(15000000, TimeUnit.MILLISECONDS).doOnError(t -> {System.out.println(t.getClass() + " replacing " + d.id()); }));
+			logger.debug("Replaced " + d.id() + " with " + d);
 		}
-//		logger.info("In doCommit(" + txid +"), initiated " + dirtied.size() + " writes");
-		return Observable.merge(all).count().map(new Func1<Integer, Throwable>() {
-			@Override
-			public Throwable call(Integer t) {
-//				logger.info("Replaced " + t + " objects");
-				state = TxState.COMMITTED;
-				txRecord.content().put("state", "committed");
-				bucket.replace(txRecord);
-				// TODO: remove the lock record
-				return null;
-			}
+		logger.info("In doCommit(" + txid +"), initiated " + dirtied.size() + " writes");
+		for (Entry<String, JsonDocument> rd : toRemove.entrySet()) {
+			logger.debug("Attempting to remove " + rd + ": " + dirtied.get(rd.getKey()));
+			if (rd.getValue() != null)
+				all.add(bucket.remove(rd.getValue()));
+			else
+				all.add(bucket.remove(dirtied.get(rd.getKey())));
+		}
+		logger.info("In doCommit(" + txid +"), initiated " + toRemove.size() + " deletes");
+		all.add(Observable.just("hello"));
+//		return Observable.merge(all).doOnNext(x->{try {throw new RuntimeException("Processed " + ((JsonDocument)x).id());} catch(Exception ex) { ex.printStackTrace(System.out); } }).doOnError(t->{System.out.println("err = " +t);}).count().flatMap(t -> {
+		return Observable.merge(all).count().flatMap(t -> {
+			logger.info("Replaced or removed " + t + " objects");
+			state = TxState.COMMITTED;
+			txRecord.content().put("state", "committed");
+			return bucket.replace(txRecord).map(x -> null);
+			// TODO: remove the lock record
 		});
 	}
 
 	public Observable<Throwable> commit() {
-		Func1<Throwable, Observable<Throwable>> checkThenCommit = new Func1<Throwable, Observable<Throwable>>() {
-			@Override
-			public Observable<Throwable> call(Throwable t) {
+		if (state == TxState.OPEN || state == TxState.ROLLBACKONLY)
+			return prepare().flatMap(t-> {
 				logger.info("in CTC, t = " + t);
 				if (t != null)
 					return Observable.just(t);
 				return doCommit();
-			}
-		};
-		if (state == TxState.OPEN || state == TxState.ROLLBACKONLY)
-			return prepare().flatMap(checkThenCommit);
+			});
 		else if (state == TxState.PREPARED)
 			return doCommit();
 		else
@@ -423,7 +485,7 @@ public class Transaction {
 	private void unlockDirties() {
 		if (dirtied.isEmpty() && brandNew.isEmpty())
 			return;
-		logger.info("Unlocking dirties");
+		logger.info("Unlocking dirties " + dirtied.keySet() + " and removing new " + brandNew);
 		List<Observable<Boolean>> os = new ArrayList<Observable<Boolean>>();
 		for (JsonDocument x : dirtied.values()) {
 			logger.info("Unlocking " + x.id());
@@ -433,7 +495,7 @@ public class Transaction {
 			logger.info("Deleting " + x);
 			os.add(bucket.remove(x).map(r -> true).onErrorReturn(err -> true));
 		}
-		Observable.merge(os).toBlocking().last();
+		Observable.merge(os).count().toBlocking().single();
 	}
 
 	// Assert according to our rules that the document has not changed since
