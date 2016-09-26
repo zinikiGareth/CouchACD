@@ -12,19 +12,21 @@ import org.junit.BeforeClass;
 import org.junit.Test;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.ziniki.couch.acdtx.InvalidTxStateException;
-import org.ziniki.couch.acdtx.Transaction;
 import org.ziniki.couch.acdtx.BaseTransactionFactory;
+import org.ziniki.couch.acdtx.InvalidTxStateException;
+import org.ziniki.couch.acdtx.ObjectNotFoundException;
+import org.ziniki.couch.acdtx.Transaction;
 import org.ziniki.couch.acdtx.TransactionFailedException;
-
-import rx.Observable;
-import rx.functions.Action1;
+import org.ziniki.couch.acdtx.TransactionTimeoutException;
 
 import com.couchbase.client.java.Bucket;
 import com.couchbase.client.java.Cluster;
 import com.couchbase.client.java.CouchbaseCluster;
 import com.couchbase.client.java.document.JsonDocument;
 import com.couchbase.client.java.document.json.JsonObject;
+
+import rx.Observable;
+import rx.functions.Func1;
 
 public class ReallyBasicTests {
 	public static Logger logger = LoggerFactory.getLogger("Tests");
@@ -99,15 +101,15 @@ public class ReallyBasicTests {
 	@Test
 	public void testWeCanReadAnObjectWhichExists() throws Exception {
 		Transaction tx = factory.open();
-		tx.get("fred").subscribe();
+		tx.get("fred").toBlocking().single();
 		checkForObservedException(tx.commit());
 		assertNotNull(bucket.get(tx.id()));
 	}
 
-	@Test(expected=TransactionFailedException.class)
+	@Test(expected=ObjectNotFoundException.class)
 	public void testWeRollbackWhenAnObjectDoesNotExist() throws Exception {
 		Transaction tx = factory.open();
-		tx.get("bert").subscribe();
+		tx.get("bert").toBlocking().single();
 		checkForObservedException(tx.commit());
 	}
 
@@ -115,17 +117,13 @@ public class ReallyBasicTests {
 	public void testWeCanChangeAnObjectIfTheresNoRollback() throws Exception {
 		Transaction tx = factory.open();
 		
-		Observable<JsonDocument> foo = tx.get("fred");
-		foo.subscribe(new Action1<JsonDocument>() {
-			public void call(JsonDocument fred) {
+		tx.get("fred").map(new Func1<JsonDocument, Void>() {
+			public Void call(JsonDocument fred) {
 				fred.content().put("version", 2);
 				tx.dirty(fred);
+				return null;
 			}
-		}, new Action1<Throwable>() {
-			public void call(Throwable t) {
-				t.printStackTrace();
-			}
-		});
+		}).toBlocking().single();
 		checkForObservedException(tx.commit());
 		assertNotNull(bucket.get(tx.id()));
 		JsonDocument readFred = bucket.get("fred");
@@ -140,17 +138,14 @@ public class ReallyBasicTests {
 		Transaction tx = factory.open();
 		logger.info("Creating tx " + tx.id());
 		
-		tx.get("fred").subscribe(new Action1<JsonDocument>() {
-			public void call(JsonDocument fred) {
+		tx.get("fred").map(new Func1<JsonDocument, Void>() {
+			public Void call(JsonDocument fred) {
 				System.out.println("obtained fred " + fred.id());
 				fred.content().put("version", 2);
 				tx.dirty(fred);
+				return null;
 			}
-		}, new Action1<Throwable>() {
-			public void call(Throwable t) {
-				t.printStackTrace();
-			}
-		});
+		}).toBlocking().single();
 		logger.info("Rolling back tx " + tx.id());
 		tx.rollback();
 		logger.info("Rolled back tx " + tx.id());
@@ -166,17 +161,13 @@ public class ReallyBasicTests {
 		Transaction tx = factory.open();
 		String id = tx.id();
 		System.out.println("Creating tx " + id);
-		Observable<JsonDocument> foo = tx.get("fred");
-		foo.subscribe(new Action1<JsonDocument>() {
-			public void call(JsonDocument fred) {
+		tx.get("fred").map(new Func1<JsonDocument, Void>() {
+			public Void call(JsonDocument fred) {
 				fred.content().put("version", 2);
 				tx.dirty(fred);
+				return null;
 			}
-		}, new Action1<Throwable>() {
-			public void call(Throwable t) {
-				t.printStackTrace();
-			}
-		});
+		}).toBlocking().single();
 		checkForObservedException(tx.prepare());
 		tx.rollback();
 		assertNull(bucket.get(id));
@@ -189,22 +180,18 @@ public class ReallyBasicTests {
 	public void testWeCannotStillRollbackATxByHandAfterCommit() throws Exception {
 		Transaction tx = factory.open();
 		
-		Observable<JsonDocument> foo = tx.get("fred");
-		foo.subscribe(new Action1<JsonDocument>() {
-			public void call(JsonDocument fred) {
+		tx.get("fred").map(new Func1<JsonDocument, Void>() {
+			public Void call(JsonDocument fred) {
 				fred.content().put("version", 2);
 				tx.dirty(fred);
+				return null;
 			}
-		}, new Action1<Throwable>() {
-			public void call(Throwable t) {
-				t.printStackTrace();
-			}
-		});
+		}).toBlocking().single();
 		checkForObservedException(tx.commit());
 		tx.rollback();
 	}
 	
-	@Test(expected=TransactionFailedException.class)
+	@Test(expected=TransactionTimeoutException.class)
 	public void testPrepareWillFailIfWeNeverUnlatch() throws Throwable {
 		Transaction tx = factory.open();
 		tx.hold();
