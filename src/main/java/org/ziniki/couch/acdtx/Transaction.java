@@ -56,7 +56,6 @@ public class Transaction {
 	private final Map<String, JsonDocument> toRemove = new HashMap<String, JsonDocument>();
 	private final JsonDocument txRecord;
 
-	
 	public enum TxState { OPEN, ROLLBACKONLY, PREPARING, PREPARED, COMMITTING, COMMITTED };
 	
 	private TxState state = TxState.OPEN;
@@ -84,6 +83,7 @@ public class Transaction {
 	}
 	
 	public Observable<JsonDocument> getOrNull(String id) {
+		logger.debug("getOrNull(" + id + ")");
 		ReadDocument holdingPen = new ReadDocument(id); 
 		synchronized (alreadyRead) {
 			if (alreadyRead.containsKey(id)) {
@@ -97,12 +97,12 @@ public class Transaction {
 
 		int reqId;
 		synchronized (sync) { reqId = request++; }
-//		System.out.println("Request " + reqId + " is for " + id + " with holding pen " + holdingPen);
+//		System.out.println("Request " + reqId + " is for " + id + " in tx " + txid + " with holding pen " + holdingPen);
 //		try { throw new RuntimeException("Request " + reqId + " is for " + id + " with holding pen " + holdingPen); } catch (RuntimeException ex) { ex.printStackTrace(System.out); }
 
 		Latch l = latch.another(txid + "_G_" + reqId);
-//				System.out.println("Scheduler is " + myScheduler);
 		return bucket.get(id).defaultIfEmpty(null).map(doc -> {
+//			System.out.println("Received response for " + reqId + ": " + id);
 			if (doc == null)
 				holdingPen.missing = true;
 			else
@@ -110,65 +110,6 @@ public class Transaction {
 			l.release();
 			return doc;
 		}).cache();
-		/*
-		, err -> {
-			synchronized (holdingPen) {
-				holdingPen.error(err);
-				holdingPen.notifyAll();
-				l.release();
-			}
-		});
-
-		OnSubscribe<JsonDocument> readit = new OnSubscribe<JsonDocument>() {
-			public void call(Subscriber<? super JsonDocument> s) {
-				synchronized (holdingPen) {
-					while (holdingPen.isEmpty() && !s.isUnsubscribed()) {
-//						SyncUtils.waitFor(holdingPen, 150);
-						SyncUtils.waitFor(holdingPen, 1500);
-						if (holdingPen.isEmpty()) {
-							System.out.println("Still waiting for " + l);
-							try { throw new RuntimeException("Still waiting for " + l); } catch (RuntimeException ex) { ex.printStackTrace(); }
-						}
-					}
-					if (s.isUnsubscribed())
-						return;
-					if (holdingPen.err != null)
-						s.onError(holdingPen.err);
-					else {
-						s.onNext(holdingPen.doc);
-						s.onCompleted();
-					}
-				}
-			}
-		};
-		List<Latch> subscriptions = new ArrayList<Latch>();
-		Observable<JsonDocument> ret = Observable.create(readit).
-			doOnSubscribe(() -> { 
-				if (state != TxState.OPEN) return;
-				synchronized(subscriptions) {
-					Latch q = latch.another(l.toString() + "_" + subscriptions.size());
-					subscriptions.add(q);
-			}}).
-			doOnUnsubscribe(() -> { synchronized(subscriptions) {
-				for (int i=0;i<subscriptions.size();i++) {
-					Latch m = subscriptions.get(i);
-					if (m != null) {
-//						System.err.println("U " + m);
-						m.release();
-						subscriptions.set(i, null);
-						synchronized (holdingPen) { holdingPen.notifyAll(); }
-						return;
-					}
-				}
-				if (state == TxState.OPEN) {
-					System.out.println("Not enough subscriptions to close");
-					System.exit(51);
-				}
-			}
-			});
-		currentlyReading.put(id, ret);
-		return ret;
-		*/
 	}
 	
 	public Observable<JsonDocument> get(String id) {
@@ -248,8 +189,7 @@ public class Transaction {
 			return JsonDocument.create(id, JsonObject.create());
 		}
 
-		logger.info("Creating new object " + id);
-		
+		logger.debug("Creating new object " + id);
 		
 		// Write an empty object to the store to make sure that we grab it and obtain a CAS
 		JsonDocument doc = push(id, JsonObject.empty());
@@ -367,18 +307,7 @@ public class Transaction {
 
 	public Observable<Throwable> prepare() {
 //		logger.info("In prepare(" + txid +"), state = " + state);
-		if (state == TxState.ROLLBACKONLY) {
-			for (Throwable t : errors)
-				logger.error("Aborting because of", t);
-			return latch.onReleased(5, TimeUnit.SECONDS).map(new Func1<Boolean, Throwable>() {
-				@Override
-				public Throwable call(Boolean b) {
-					unlockDirties();
-					return new TransactionFailedException(errors);
-				}
-			});
-		}
-		if (state != TxState.OPEN)
+		if (state != TxState.OPEN && state != TxState.ROLLBACKONLY)
 			return latch.onReleased(5, TimeUnit.SECONDS).map(new Func1<Boolean, Throwable>() {
 				@Override
 				public Throwable call(Boolean t) {
@@ -433,7 +362,7 @@ public class Transaction {
 		for (JsonDocument d : dirtied.values()) {
 			if (toRemove.containsKey(d.id()))
 				continue;
-			all.add(bucket.replace(d).timeout(15000000, TimeUnit.MILLISECONDS).doOnError(t -> {System.out.println(t.getClass() + " replacing " + d.id()); }));
+			all.add(bucket.replace(d).timeout(500, TimeUnit.MILLISECONDS).doOnError(t -> {System.out.println(t.getClass() + " replacing " + d.id()); }));
 			logger.debug("Replaced " + d.id() + " with " + d);
 		}
 		logger.info("In doCommit(" + txid +"), initiated " + dirtied.size() + " writes");

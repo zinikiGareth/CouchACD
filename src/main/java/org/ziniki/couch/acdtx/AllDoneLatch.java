@@ -42,7 +42,7 @@ public class AllDoneLatch {
 		requests++;
 //		System.err.println(id + " another: " + completed + "/" + requests);
 		/*
-		if (id.endsWith("_G_0"))
+		if (id.endsWith("_G_24") || id.endsWith("_G_25"))
 		try {
 			throw new RuntimeException("latched " + id + ": " + completed + "/" + requests);
 		} catch (Exception ex) {
@@ -64,7 +64,7 @@ public class AllDoneLatch {
 
 	private synchronized void done(String id) {
 		/*
-		if (id.endsWith("_G_1"))
+		if (id.endsWith("_G_0"))
 		try {
 			throw new RuntimeException("released " + completed + "/" + requests);
 		} catch (Exception ex) {
@@ -72,6 +72,7 @@ public class AllDoneLatch {
 		}
 		*/
 		completed++;
+//		System.err.println(id + " done: " + completed + "/" + requests);
 		if (!outstanding.remove(id))
 			throw new RuntimeException("Was not waiting for " + id + " have " + outstanding);
 		if (completed > requests) {
