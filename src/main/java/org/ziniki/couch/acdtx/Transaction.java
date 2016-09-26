@@ -237,8 +237,9 @@ public class Transaction {
 			public void call(Throwable t) {
 				logger.info("Attempt to insert failed", uex);
 				logger.info("Insert for id " + id + " failed", t);
+				brandNew.remove(id);
+				error(uex);
 				l.release();
-				error(t);
 			}
 		});
 	
@@ -315,6 +316,12 @@ public class Transaction {
 		if (!worked) {
 			unlockDirties();
 			return Observable.just(new TransactionTimeoutException());
+		}
+		if (state == TxState.ROLLBACKONLY) {
+			for (Throwable t : errors)
+				logger.error("Aborting because of", t);
+			unlockDirties();
+			return Observable.just(new TransactionFailedException(errors));
 		}
 		AllDoneLatch platch = new AllDoneLatch();
 		state = TxState.PREPARING;
