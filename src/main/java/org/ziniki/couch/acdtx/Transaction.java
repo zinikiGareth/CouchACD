@@ -87,10 +87,7 @@ public class Transaction {
 		ReadDocument holdingPen = new ReadDocument(id); 
 		synchronized (alreadyRead) {
 			if (alreadyRead.containsKey(id)) {
-				ReadDocument ct = alreadyRead.get(id);
-				JsonDocument send = ct.doc;
-				if (ct.missing || send != null)
-					return Observable.just(send);
+				return alreadyRead.get(id).observer();
 			} else
 				alreadyRead.put(id, holdingPen);
 		}
@@ -104,7 +101,7 @@ public class Transaction {
 		return bucket.get(id).defaultIfEmpty(null).map(doc -> {
 //			System.out.println("Received response for " + reqId + ": " + id);
 			if (doc == null)
-				holdingPen.missing = true;
+				holdingPen.missing();
 			else
 				holdingPen.setDocument(doc);
 			l.release();
@@ -143,8 +140,7 @@ public class Transaction {
 		if (requestedDirty.contains(id)) {
 			// we already have it locked; don't need to do that again
 			// we have to assume that the user always uses the same object; avoiding that would involve us in race issues
-			if (doc != alreadyRead.get(id).doc)
-				throw new InvalidTxStateException("You cannot use two different objects for the same ID in the same TX");
+			alreadyRead.get(id).assertSameDoc(doc);
 			return;
 		}
 		requestedDirty.add(id);
@@ -435,8 +431,7 @@ public class Transaction {
 		ReadDocument mine = alreadyRead.get(id);
 
 		String versionField = factory.versionField();
-		Object oldV = mine.doc.content().get(versionField);
-		System.err.println("id = " + id + " vf = " + versionField + " oldV = " + oldV + " mine = " + mine + " mh = " + (mine == null?"N/A":mine.hash) + " nc = " + newContent.hashCode() + " mine = " + (mine == null ? "N/A" : mine.doc.content()) + " new = " + newContent);
+		Object oldV = mine.getVersion(versionField);
 		if (versionField == null || oldV == null)
 			return mine != null && mine.hash == newContent.hashCode();
 		Object newV = newContent.get(versionField);
